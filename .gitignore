@@ -1,0 +1,11 @@
+# video production intermediates and the rendered movie stay out of git
+video/final.mp4
+video/seg*.mp4
+video/concat.txt
+video/frames/
+video/framesA/
+video/framesB/
+video/framesC/
+video/framesD/
+video/assets/
+out/
