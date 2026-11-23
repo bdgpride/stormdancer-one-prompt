@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STORMDANCER — a neon dragonfly game, built from one prompt</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05060f; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { width: 100vw; height: 100vh; object-fit: contain; display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1280" height="720"></canvas>
+<script>
+"use strict";
+// STORMDANCER — you are a neon dragonfly weaving through a thunderstorm.
+// Hold (mouse / touch / SPACE) to climb, release to dive.
+// Snatch glowing fireflies (+10), dodge storm clouds (3 hearts), 60 seconds.
+//
+// Deterministic simulation: fixed-timestep, seeded RNG, precomputed spawns.
+//   ?demo=1   the game plays itself (used for the video capture)
+//   ?t=12.5   jump to the exact state at t seconds and hold that frame
+
+const W = 1280, H = 720;
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+const params = new URLSearchParams(location.search);
+const DEMO = params.has("demo");
+const SEEK_T = params.has("t") ? parseFloat(params.get("t")) : null;
+const START_T = params.has("start") ? parseFloat(params.get("start")) : 0;
+
+// ---------- seeded RNG ----------
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- game state ----------
+const ROUND_LEN = 60;
+let S = null;
+
+function buildSpawnTable(rng) {
+  const table = [];
+  let tf = 0.7;
+  while (tf < ROUND_LEN + 4) {
+    table.push({ t: tf, kind: "firefly", y: 90 + rng() * (H - 180), r: 13, wob: rng() * Math.PI * 2 });
+    tf += 0.55 + rng() * 0.5;
+  }
+  let tc = 1.6;
+  while (tc < ROUND_LEN + 4) {
+    table.push({ t: tc, kind: "cloud", y: 70 + rng() * (H - 140), r: 34 + rng() * 26, wob: rng() * Math.PI * 2 });
+    tc += 1.15 + rng() * 0.85;
+  }
+  table.sort((a, b) => a.t - b.t);
+  return table;
+}
+
+function reset(seed) {
+  const rng = mulberry32(seed);
+  S = {
+    t: 0, seed,
+    spawns: buildSpawnTable(rng), spawnIdx: 0,
+    fly: { x: 300, y: H / 2, vy: 0, wing: 0 },
+    holding: false, holdPrev: false,
+    entities: [], particles: [], popups: [],
+    score: 0, combo: 0, comboT: 0, hearts: 3,
+    invuln: 0, shake: 0, flash: 0, nextFlash: 3.5 + rng() * 3,
+    rng,
+    over: false, overT: 0, started: DEMO,
+  };
+}
+
+// ---------- autopilot (demo mode) ----------
+function autopilot() {
+  const f = S.fly;
+  let desired = H * 0.5 + Math.sin(S.t * 0.7) * 120;
+  // nearest firefly ahead wins, unless a cloud blocks the lane
+  let best = null, bestDx = 1e9;
+  let threat = null;
+  for (const e of S.entities) {
+    if (e.kind === "firefly" && !e.taken && e.x > f.x - 30) {
+      const dx = e.x - f.x;
+      if (dx < bestDx) { bestDx = dx; best = e; }
+    }
+    if (e.kind === "cloud" && e.x > f.x - 20 && e.x < f.x + 300) {
+      if (Math.abs(e.y - f.y) < e.r + 52) threat = e;
+    }
+  }
+  if (best) desired = best.y + Math.sin(S.t * 6 + best.wob) * 10;
+  if (threat) desired = threat.y + (f.y < threat.y ? -(threat.r + 95) : threat.r + 95);
+  desired = Math.max(64, Math.min(H - 64, desired));
+  if (f.y > desired + 5) S.holding = true;
+  else if (f.y < desired - 5) S.holding = false;
+}
+
+// ---------- simulation ----------
+const DT = 1 / 240;
+function step(dt) {
+  const f = S.fly;
+  S.t += dt;
+  if (DEMO) autopilot();
+
+  // physics: hold to climb, release to dive
+  const accel = S.holding ? -2050 : 1450;
+  f.vy += accel * dt;
+  f.vy = Math.max(-540, Math.min(560, f.vy));
+  f.y += f.vy * dt;
+  if (f.y < 26) { f.y = 26; f.vy = Math.max(0, f.vy); }
+  if (f.y > H - 26) { f.y = H - 26; f.vy = Math.min(0, f.vy); }
+  f.wing += dt * (S.holding ? 70 : 46);
+
+  // spawns
+  const speed = scrollSpeed();
+  while (S.spawnIdx < S.spawns.length && S.spawns[S.spawnIdx].t <= S.t) {
+    const s = S.spawns[S.spawnIdx++];
+    S.entities.push({ ...s, x: W + 70, baseY: s.y, taken: false, dead: false });
+  }
+
+  // entities
+  for (const e of S.entities) {
+    e.x -= speed * dt;
+    e.y = e.baseY + Math.sin(S.t * 1.7 + e.wob) * (e.kind === "firefly" ? 14 : 7);
+    if (e.x < -90) e.dead = true;
+    if (S.invuln <= 0 && !e.taken) {
+      const dx = e.x - f.x, dy = e.y - f.y;
+      const d2 = dx * dx + dy * dy;
+      if (e.kind === "firefly" && d2 < 42 * 42) {
+        e.taken = true; e.dead = true;
+        S.score += 10;
+        S.combo += 1; S.comboT = 2.5;
+        burst(e.x, e.y, "#ffe066", 14);
+        S.popups.push({ x: e.x, y: e.y - 18, t: 0, text: "+10", color: "#ffe066" });
+        if (S.combo > 0 && S.combo % 5 === 0)
+          S.popups.push({ x: f.x + 30, y: f.y - 44, t: 0, text: "COMBO x" + S.combo, color: "#7bf1ff" });
+      } else if (e.kind === "cloud" && d2 < (e.r * 0.72) * (e.r * 0.72)) {
+        e.taken = true;
+        S.hearts -= 1; S.invuln = 1.6; S.shake = 14; S.combo = 0;
+        burst(f.x, f.y, "#ff5d7a", 22);
+        S.popups.push({ x: f.x + 10, y: f.y - 40, t: 0, text: "OUCH!", color: "#ff5d7a" });
+        if (S.hearts <= 0 && !S.over) { S.over = true; S.overT = S.t; }
+      }
+    }
+  }
+  S.entities = S.entities.filter(e => !e.dead);
+
+  // combo timer
+  if (S.comboT > 0) { S.comboT -= dt; if (S.comboT <= 0) S.combo = 0; }
+
+  // particles
+  for (const p of S.particles) {
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 300 * dt; p.life -= dt;
+  }
+  S.particles = S.particles.filter(p => p.life > 0);
+
+  // popups
+  for (const p of S.popups) { p.t += dt; p.y -= 44 * dt; }
+  S.popups = S.popups.filter(p => p.t < 0.9);
+
+  // ambience: lightning
+  if (S.t >= S.nextFlash) { S.flash = 1; S.nextFlash = S.t + 3.5 + S.rng() * 3.5; }
+  S.flash = Math.max(0, S.flash - dt * 2.6);
+  S.shake = Math.max(0, S.shake - dt * 34);
+  S.invuln = Math.max(0, S.invuln - dt);
+
+  // wing trail sparkles
+  if (Math.random() < 0.6) { /* visual only in draw; keep sim clean */ }
+
+  // round end: in demo, pause on the final score then loop
+  if (!S.over && S.t >= ROUND_LEN) { S.over = true; S.overT = S.t; }
+  if (S.over && DEMO && S.t - S.overT > 3) reset(S.seed);
+}
+
+function scrollSpeed() { return Math.min(430, 320 + S.t * 2.2); }
+
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = S.rng() * Math.PI * 2, sp = 60 + S.rng() * 240;
+    S.particles.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 40, life: 0.45 + S.rng() * 0.4, color, r: 2 + S.rng() * 3 });
+  }
+}
+
+// ---------- drawing ----------
+function draw() {
+  const t = S.t;
+  const shx = S.shake ? (Math.sin(t * 91) * S.shake) : 0;
+  const shy = S.shake ? (Math.cos(t * 83) * S.shake * 0.7) : 0;
+  ctx.save();
+  ctx.translate(shx, shy);
+
+  // storm sky
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#0a1030"); g.addColorStop(0.55, "#131a45"); g.addColorStop(1, "#241040");
+  ctx.fillStyle = g; ctx.fillRect(-20, -20, W + 40, H + 40);
+
+  // distant glow + far clouds (stateless, functions of t)
+  for (let i = 0; i < 6; i++) {
+    const cx = W - ((t * 26 + i * 257) % (W + 300)) + 150;
+    const cy = 50 + (i * 83) % 190;
+    ctx.fillStyle = "rgba(52,60,120,0.32)";
+    blob(cx, cy, 52 + (i % 3) * 16);
+  }
+  // rain (stateless)
+  ctx.strokeStyle = "rgba(150,180,255,0.26)"; ctx.lineWidth = 2; ctx.beginPath();
+  for (let i = 0; i < 80; i++) {
+    const rx = (i * 173.3 + (i % 7) * 41) % W;
+    const ry = ((i * 269.7 + t * (820 + (i % 4) * 60)) % (H + 60)) - 30;
+    ctx.moveTo(rx, ry); ctx.lineTo(rx - 7, ry + 20 + (i % 3) * 5);
+  }
+  ctx.stroke();
+
+  // entities
+  for (const e of S.entities) {
+    if (e.kind === "cloud") drawCloud(e); else drawFirefly(e, t);
+  }
+
+  drawDragonfly(t);
+
+  // particles
+  for (const p of S.particles) {
+    ctx.globalAlpha = Math.max(0, p.life * 1.8);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // popups
+  for (const p of S.popups) {
+    ctx.globalAlpha = 1 - p.t / 0.9;
+    ctx.font = "800 30px system-ui, sans-serif";
+    ctx.fillStyle = p.color; ctx.textAlign = "center";
+    ctx.fillText(p.text, p.x, p.y);
+  }
+  ctx.globalAlpha = 1;
+
+  // lightning wash
+  if (S.flash > 0) { ctx.fillStyle = `rgba(220,228,255,${(S.flash * 0.22).toFixed(3)})`; ctx.fillRect(-20, -20, W + 40, H + 40); }
+
+  ctx.restore();
+  drawHUD(t);
+}
+
+function blob(x, y, r) {
+  // one path per circle: several arcs in a single path would be joined by
+  // straight chords and fill as wedges
+  const puffs = [[0, 0, 0.62], [-0.38, 0.1, 0.5], [0.38, 0.08, 0.52]];
+  for (const [ox, oy, orr] of puffs) {
+    ctx.beginPath();
+    ctx.arc(x + ox * r, y + oy * r, orr * r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawCloud(e) {
+  const flicker = 0.5 + 0.5 * Math.sin(S.t * 9 + e.wob * 3);
+  ctx.save();
+  ctx.shadowColor = "rgba(120,90,255,0.8)"; ctx.shadowBlur = 24;
+  ctx.fillStyle = "#2b2f55";
+  blob(e.x, e.y, e.r);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#3d4276";
+  blob(e.x - e.r * 0.18, e.y - e.r * 0.16, e.r * 0.62);
+  // charged core
+  ctx.fillStyle = `rgba(178,132,255,${0.25 + flicker * 0.3})`;
+  ctx.beginPath(); ctx.arc(e.x, e.y + e.r * 0.1, e.r * 0.2, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function drawFirefly(e, t) {
+  const pulse = 0.75 + 0.25 * Math.sin(t * 7 + e.wob * 5);
+  ctx.save();
+  ctx.shadowColor = "#ffd94d"; ctx.shadowBlur = 26 * pulse;
+  const g = ctx.createRadialGradient(e.x, e.y, 1, e.x, e.y, 16 * pulse);
+  g.addColorStop(0, "#fff7c4"); g.addColorStop(0.4, "#ffe066"); g.addColorStop(1, "rgba(255,180,0,0)");
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(e.x, e.y, 16 * pulse, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function drawDragonfly(t) {
+  const f = S.fly;
+  if (S.invuln > 0 && Math.floor(t * 14) % 2 === 0 && !S.over) ctx.globalAlpha = 0.35;
+  const tilt = Math.max(-0.5, Math.min(0.6, f.vy / 900));
+  ctx.save();
+  ctx.translate(f.x, f.y); ctx.rotate(tilt);
+  // wing trail
+  ctx.strokeStyle = "rgba(123,241,255,0.35)"; ctx.lineWidth = 3; ctx.beginPath();
+  ctx.moveTo(-24, 0); ctx.quadraticCurveTo(-52, 6 + Math.sin(t * 30) * 4, -78, 14);
+  ctx.stroke();
+  // wings: two translucent pairs sweeping up-back off the body, fluttering
+  const flap = Math.sin(f.wing) * 0.16;
+  ctx.fillStyle = "rgba(200,248,255,0.65)";
+  for (const [wx, wy, len, wid, base] of [[8, -6, 34, 10, -0.85], [-6, -5, 25, 8, -1.15]]) {
+    ctx.save(); ctx.translate(wx, wy); ctx.rotate(base + flap);
+    ctx.beginPath(); ctx.ellipse(len / 2, 0, len / 2, wid / 2, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    ctx.save(); ctx.translate(wx, -wy); ctx.rotate(-base - flap); ctx.scale(1, -1);
+    ctx.beginPath(); ctx.ellipse(len / 2, 0, len / 2, wid / 2, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+  // body
+  ctx.shadowColor = "#37f4ff"; ctx.shadowBlur = 18;
+  const bg = ctx.createLinearGradient(-26, 0, 30, 0);
+  bg.addColorStop(0, "#ff4fd8"); bg.addColorStop(0.55, "#37f4ff"); bg.addColorStop(1, "#7bf1ff");
+  ctx.fillStyle = bg;
+  ctx.beginPath(); ctx.ellipse(0, 0, 30, 10, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.shadowBlur = 0;
+  // tail segments
+  ctx.fillStyle = "#ff4fd8";
+  for (let i = 1; i <= 3; i++) { ctx.beginPath(); ctx.arc(-28 - i * 11, Math.sin(t * 10 + i) * 2, 5.5 - i, 0, Math.PI * 2); ctx.fill(); }
+  // eye
+  ctx.fillStyle = "#ffffff"; ctx.beginPath(); ctx.arc(20, -3, 5.5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#10142b"; ctx.beginPath(); ctx.arc(22, -3, 2.8, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+function drawHUD(t) {
+  // score
+  ctx.textAlign = "left";
+  ctx.font = "800 44px system-ui, sans-serif";
+  ctx.fillStyle = "#ffffff";
+  ctx.shadowColor = "rgba(55,244,255,0.8)"; ctx.shadowBlur = 14;
+  ctx.fillText(String(S.score), 30, 58);
+  ctx.shadowBlur = 0;
+  ctx.font = "700 17px system-ui, sans-serif"; ctx.fillStyle = "#9fd8ff";
+  ctx.fillText("SCORE", 32, 84);
+  if (S.combo >= 2) { ctx.fillStyle = "#ffe066"; ctx.fillText("COMBO x" + S.combo, 32, 110); }
+
+  // hearts
+  for (let i = 0; i < 3; i++) {
+    ctx.font = "34px system-ui, sans-serif"; ctx.textAlign = "right";
+    ctx.fillStyle = i < S.hearts ? "#ff5d7a" : "rgba(255,255,255,0.18)";
+    ctx.fillText("♥", W - 30 - i * 42, 56);
+  }
+
+  // timer bar
+  const remain = Math.max(0, ROUND_LEN - t);
+  const frac = remain / ROUND_LEN;
+  ctx.fillStyle = "rgba(255,255,255,0.15)";
+  ctx.fillRect(W / 2 - 210, 22, 420, 13);
+  ctx.fillStyle = frac > 0.25 ? "#37f4ff" : "#ff5d7a";
+  ctx.fillRect(W / 2 - 210, 22, 420 * frac, 13);
+  ctx.font = "800 22px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.fillStyle = "#fff";
+  ctx.fillText(remain.toFixed(0) + "s", W / 2, 62);
+
+  if (!S.started) {
+    ctx.fillStyle = "rgba(4,6,20,0.55)"; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#7bf1ff"; ctx.font = "900 74px system-ui, sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("STORMDANCER", W / 2, 300);
+    ctx.fillStyle = "#ffffff"; ctx.font = "600 27px system-ui, sans-serif";
+    ctx.fillText("You are a neon dragonfly in a thunderstorm.", W / 2, 356);
+    ctx.fillText("HOLD to climb · RELEASE to dive · snatch fireflies · dodge the clouds", W / 2, 398);
+    ctx.fillStyle = "#ffe066"; ctx.font = "800 30px system-ui, sans-serif";
+    ctx.fillText("Hold SPACE or press to start", W / 2, 470);
+  }
+  if (S.over) {
+    ctx.fillStyle = "rgba(4,6,20,0.5)"; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#ffe066"; ctx.font = "900 68px system-ui, sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(S.hearts <= 0 ? "STORM GOT YOU" : "TIME UP!", W / 2, 320);
+    ctx.fillStyle = "#ffffff"; ctx.font = "800 40px system-ui, sans-serif";
+    ctx.fillText("Final score: " + S.score, W / 2, 386);
+    if (!DEMO) { ctx.font = "600 24px system-ui, sans-serif"; ctx.fillStyle = "#9fd8ff"; ctx.fillText("Press SPACE to fly again", W / 2, 436); }
+  }
+}
+
+// ---------- input & main loop ----------
+function setHold(v) {
+  if (!S.started) { S.started = true; }
+  if (S.over && v && !DEMO) { reset(20261122); S.started = true; }
+  S.holding = v;
+}
+addEventListener("keydown", e => { if (e.code === "Space" || e.code === "ArrowUp") { e.preventDefault(); setHold(true); } });
+addEventListener("keyup", e => { if (e.code === "Space" || e.code === "ArrowUp") setHold(false); });
+addEventListener("pointerdown", () => setHold(true));
+addEventListener("pointerup", () => setHold(false));
+addEventListener("pointercancel", () => setHold(false));
+
+reset(20261122);
+
+if (SEEK_T !== null) {
+  // deterministic frame: simulate to t, draw once, hold
+  const steps = Math.round(SEEK_T / DT);
+  for (let i = 0; i < steps; i++) step(DT);
+  draw();
+} else {
+  // live mode: optionally pre-simulate so a capture can join mid-action
+  const startSteps = Math.round(START_T / DT);
+  for (let i = 0; i < startSteps; i++) step(DT);
+  let last = performance.now(), acc = 0;
+  function frame(now) {
+    acc += Math.min(0.1, (now - last) / 1000); last = now;
+    while (acc >= DT) { step(DT); acc -= DT; }
+    draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
